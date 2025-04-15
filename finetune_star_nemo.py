@@ -514,5 +514,27 @@ def add_attention_hooks(model):
     
     return model
 
+def add_nemo_attention_hooks(model):
+    """Add hooks to capture attention weights from Conformer layers"""
+    
+    # Function to capture attention weights
+    def capture_attention(self, module, input, output):
+        # For nemo multi-head attention, the attention weights are not stored, so extract from the attention dropout's input
+        # The exact structure depends on the implementation
+        if isinstance(input, tuple) and len(input) > 0:
+            # Often attention weights are the 2nd element in the output tuple
+            self.attention_weights = input[0]
+        
+    # Add hooks to all self-attention modules in the encoder
+    for i, layer in enumerate(model.encoder.conformer_layers):
+        if hasattr(layer, 'self_attn'):
+            # Register forward hook to capture attention
+            layer.self_attn.attention_weights = None
+            layer.self_attn.dropout.register_forward_hook(
+                types.MethodType(capture_attention, layer.self_attention)
+            )
+    
+    return model
+
 if __name__ == "__main__":
     fire.Fire(train) 
