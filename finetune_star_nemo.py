@@ -10,6 +10,7 @@ from typing import Optional, List, Dict, Any, Union, Tuple
 from pathlib import Path
 from jiwer import wer as calculate_wer
 from tqdm import tqdm
+import types
 
 # NeMo imports
 import nemo
@@ -42,11 +43,12 @@ class StarRNNT:
         self.tau = tau
         self.state_dict = copy.deepcopy(asr_model.state_dict())
         
-    def get_star_scores(self, hyp: Hypothesis) -> List[float]:
+    def get_star_scores(self, hyp: Hypothesis, encoder_outputs=None) -> List[float]:
         """Calculate STAR scores from a hypothesis
         
         Args:
             hyp: Hypothesis object with token confidences
+            encoder_outputs: Optional outputs from encoder with attention weights
             
         Returns:
             List of STAR scores for each token
@@ -67,29 +69,61 @@ class StarRNNT:
         probs = [round(p / mean_probs, 3) for p in probs]
         
         # Get attention weights
-        # Since we don't have direct access to attention weights in RNN-T,
-        # we estimate them based on timestamps and duration as a proxy for attention
         weights = []
         
-        # If timestamps available, use them to estimate attention weights
-        if hasattr(hyp, 'timestamp') and hyp.timestamp:
-            timestamp = hyp.timestamp
-            if isinstance(timestamp, dict):
-                timestamp = timestamp.get('timestep', [])
+        # Try to extract attention weights directly from FastConformer
+        if encoder_outputs is not None and hasattr(encoder_outputs, 'attention_weights'):
+            # Get attention weights from encoder
+            attn_weights = encoder_outputs.attention_weights
+            print("=== using fastconformer attention weights ===")
             
-            if timestamp:
-                # Calculate normalized time progression as attention estimate
-                max_time = max(timestamp) if timestamp else 1
-                weights = [round(t / max_time, 3) for t in timestamp]
+            # Select a representative layer and head (typically last layer works well)
+            if isinstance(attn_weights, list) and len(attn_weights) > 0:
+                # Take the last layer's attention
+                layer_attn = attn_weights[-1]
                 
-                # Normalize weights
-                mean_weights = sum(weights) / len(weights)
-                weights = [round(w / mean_weights, 3) for w in weights]
+                # Average across heads or take a specific head
+                # For simplicity, let's average across all heads
+                avg_attn = layer_attn.mean(dim=1)  # Shape: [batch, seq_len, seq_len]
+                
+                # Extract relevant attention scores for each token
+                # This mapping can be complex and depends on how the model aligns
+                # encoder frame positions to decoded tokens
+                if hasattr(hyp, 'alignments') and hyp.alignments:
+                    for align_idx in hyp.alignments:
+                        if isinstance(align_idx, list):
+                            # For RNNT, alignments can be 2D
+                            # We need to find corresponding encoder frames
+                            continue
+                        elif isinstance(align_idx, int):
+                            # For simpler cases, direct mapping
+                            if 0 <= align_idx < avg_attn.size(-1):
+                                # Sum attention for this position
+                                weight = avg_attn[0, align_idx, :].sum().item()
+                                weights.append(weight)
         
-        # If no timestamp info, use uniform weights
+        # If direct attention extraction failed or returned empty, fall back to timestamp-based approach
+        if not weights:
+            # If timestamps available, use them to estimate attention weights
+            if hasattr(hyp, 'timestamp') and hyp.timestamp:
+                timestamp = hyp.timestamp
+                if isinstance(timestamp, dict):
+                    timestamp = timestamp.get('timestep', [])
+                
+                if timestamp:
+                    # Calculate normalized time progression as attention estimate
+                    max_time = max(timestamp) if timestamp else 1
+                    weights = [round(t / max_time, 3) for t in timestamp]
+        
+        # If still no weights, use uniform weights
         if not weights:
             weights = [1.0] * len(probs)
-            
+        
+        # Normalize weights
+        if weights:
+            mean_weights = sum(weights) / len(weights)
+            weights = [round(w / mean_weights, 3) for w in weights]
+        
         # Calculate STAR scores (final_weights)
         final_weights = []
         for ci, ai in zip(probs, weights):
@@ -97,7 +131,7 @@ class StarRNNT:
             conflict = (sigmoid((c_over_a - self.threshold) * self.tau) + sigmoid((a_over_c - self.threshold) * self.tau)) * ai
             no_conflict = (sigmoid((self.threshold - c_over_a) * self.tau) * sigmoid((self.threshold - a_over_c) * self.tau)) * ai * np.exp((ci - ai) / self.tau)
             final_weights.append(conflict + no_conflict)
-            
+        
         return final_weights
     
     def generate_pseudo_labels(self, audio: torch.Tensor, sample_rate: int = 16000) -> Tuple[str, List[float], float, int]:
@@ -117,9 +151,18 @@ class StarRNNT:
         # Put model in evaluation mode and process audio
         self.asr_model.eval()
         with torch.no_grad():
-            # Encode audio
+            # Set the model to output attention weights
+            self.asr_model.encoder._capture_attention = True
+            
+            # Process audio
             features = self.asr_model.preprocessor(audio.unsqueeze(0).to(device))
             encoded, encoded_len = self.asr_model.encoder(features)
+            
+            # Store encoder outputs with attention
+            encoder_outputs = encoded  # This should now contain attention_weights attribute
+            
+            # Reset attention capturing to avoid memory issues
+            self.asr_model.encoder._capture_attention = False
             
             # Get beam search results with confidence scores
             beam_results = self.asr_model.decoding.rnnt_decoder_predictions_tensor(
@@ -133,7 +176,7 @@ class StarRNNT:
             hyp = beam_results[0][0]  # First sample, best hypothesis
             
             # Calculate STAR scores
-            star_scores = self.get_star_scores(hyp)
+            star_scores = self.get_star_scores(hyp, encoder_outputs)
             
             # Get transcription
             transcription = hyp.text if hyp.text else ''
@@ -411,6 +454,65 @@ def train(
     # Save final model
     model.save_to(f"{exp_dir}/final_model.nemo")
     logging.info(f"Training complete. Best WER: {best_wer:.4f}")
+
+def setup_attention_capture(model):
+    """Add attention capturing capability to the model's encoder"""
+    encoder = model.encoder
+    
+    # Store the original forward method
+    original_forward = encoder.forward
+    
+    # Create a new forward method that can capture attention
+    def forward_with_attention(self, audio_signal, length=None):
+        # Call the original forward method
+        outputs = original_forward(audio_signal, length)
+        
+        # If attention capturing is enabled, extract and attach attention weights
+        if hasattr(self, '_capture_attention') and self._capture_attention:
+            # This assumes the conformer/fastconformer has self-attention layers
+            # Extract attention from the relevant layers
+            attention_weights = []
+            for layer in self.conformer_layers:
+                if hasattr(layer, 'self_attention'):
+                    # Assume self_attention module has stored attention weights
+                    # You might need to modify the self-attention module to store these weights
+                    if hasattr(layer.self_attention, 'attention_weights'):
+                        attention_weights.append(layer.self_attention.attention_weights)
+            
+            # Attach attention weights to outputs
+            outputs.attention_weights = attention_weights
+        
+        return outputs
+    
+    # Add the capture flag
+    encoder._capture_attention = False
+    
+    # Replace the forward method
+    encoder.forward = types.MethodType(forward_with_attention, encoder)
+    
+    return model
+
+def add_attention_hooks(model):
+    """Add hooks to capture attention weights from Conformer layers"""
+    
+    # Function to capture attention weights
+    def capture_attention(self, module, input, output):
+        # For multi-head attention, the attention weights are typically in the output
+        # The exact structure depends on the implementation
+        if isinstance(output, tuple) and len(output) > 1:
+            # Often attention weights are the 2nd element in the output tuple
+            self.attention_weights = output[1]
+        
+    # Add hooks to all self-attention modules in the encoder
+    for i, layer in enumerate(model.encoder.conformer_layers):
+        if hasattr(layer, 'self_attention'):
+            # Register forward hook to capture attention
+            layer.self_attention.attention_weights = None
+            layer.self_attention.register_forward_hook(
+                types.MethodType(capture_attention, layer.self_attention)
+            )
+    
+    return model
 
 if __name__ == "__main__":
     fire.Fire(train) 
